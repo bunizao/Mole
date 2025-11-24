@@ -7,6 +7,45 @@ set -euo pipefail
 enter_alt_screen() { tput smcup 2> /dev/null || true; }
 leave_alt_screen() { tput rmcup 2> /dev/null || true; }
 
+# Get terminal height with fallback
+_ms_get_terminal_height() {
+    local height=0
+
+    # Try stty size first (most reliable, real-time)
+    # Use </dev/tty to ensure we read from terminal even if stdin is redirected
+    if [[ -t 0 ]] || [[ -t 2 ]]; then
+        height=$(stty size </dev/tty 2>/dev/null | awk '{print $1}')
+    fi
+
+    # Fallback to tput
+    if [[ -z "$height" || $height -le 0 ]]; then
+        if command -v tput > /dev/null 2>&1; then
+            height=$(tput lines 2>/dev/null || echo "24")
+        else
+            height=24
+        fi
+    fi
+
+    echo "$height"
+}
+
+# Calculate dynamic items per page based on terminal height
+_ms_calculate_items_per_page() {
+    local term_height=$(_ms_get_terminal_height)
+    # Layout: header(1) + spacing(1) + items + spacing(1) + footer(1) + clear(1) = 5 fixed lines
+    local reserved=6  # Increased to prevent header from being overwritten
+    local available=$((term_height - reserved))
+
+    # Ensure minimum and maximum bounds
+    if [[ $available -lt 1 ]]; then
+        echo 1
+    elif [[ $available -gt 50 ]]; then
+        echo 50
+    else
+        echo "$available"
+    fi
+}
+
 # Main paginated multi-select menu function
 paginated_multi_select() {
     local title="$1"
@@ -24,7 +63,7 @@ paginated_multi_select() {
     fi
 
     local total_items=${#items[@]}
-    local items_per_page=15
+    local items_per_page=$(_ms_calculate_items_per_page)
     local cursor_pos=0
     local top_index=0
     local -a selected=()
@@ -106,6 +145,9 @@ paginated_multi_select() {
 
     # Draw the complete menu
     draw_menu() {
+        # Recalculate items_per_page dynamically to handle window resize
+        items_per_page=$(_ms_calculate_items_per_page)
+
         # Move to home position without clearing (reduces flicker)
         printf "\033[H" >&2
 
@@ -168,27 +210,10 @@ paginated_multi_select() {
 
         # Clear any remaining lines at bottom
         printf "${clear_line}\n" >&2
-        printf "${clear_line}${GRAY}${ICON_NAV_UP}/${ICON_NAV_DOWN}${NC} Navigate  ${GRAY}|${NC}  ${GRAY}Space${NC} Select  ${GRAY}|${NC}  ${GRAY}Enter${NC} Confirm  ${GRAY}|${NC}  ${GRAY}Q${NC} Quit\n" >&2
+        printf "${clear_line}${GRAY}${ICON_NAV_UP}${ICON_NAV_DOWN}  |  Space  |  Enter  |  Q Exit${NC}\n" >&2
 
         # Clear one more line to ensure no artifacts
         printf "${clear_line}" >&2
-    }
-
-    # Show help screen
-    show_help() {
-        printf "\033[H\033[J" >&2
-        cat >&2 << EOF
-Help - Navigation Controls
-==========================
-
-  ${ICON_NAV_UP} / ${ICON_NAV_DOWN}      Navigate up/down
-  Space              Select/deselect item
-  Enter              Confirm selection
-  Q / ESC            Exit
-
-Press any key to continue...
-EOF
-        read -n 1 -s >&2
     }
 
     # Main interaction loop
@@ -252,7 +277,6 @@ EOF
                     selected[i]=false
                 done
                 ;;
-            "HELP") show_help ;;
             "ENTER")
                 # Store result in global variable instead of returning via stdout
                 local -a selected_indices=()

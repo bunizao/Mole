@@ -15,6 +15,44 @@ leave_alt_screen() {
     fi
 }
 
+# Get terminal height with fallback
+_pm_get_terminal_height() {
+    local height=0
+
+    # Try stty size first (most reliable, real-time)
+    # Use </dev/tty to ensure we read from terminal even if stdin is redirected
+    if [[ -t 0 ]] || [[ -t 2 ]]; then
+        height=$(stty size </dev/tty 2>/dev/null | awk '{print $1}')
+    fi
+
+    # Fallback to tput
+    if [[ -z "$height" || $height -le 0 ]]; then
+        if command -v tput > /dev/null 2>&1; then
+            height=$(tput lines 2>/dev/null || echo "24")
+        else
+            height=24
+        fi
+    fi
+
+    echo "$height"
+}
+
+# Calculate dynamic items per page based on terminal height
+_pm_calculate_items_per_page() {
+    local term_height=$(_pm_get_terminal_height)
+    local reserved=6  # header(2) + footer(3) + spacing(1)
+    local available=$((term_height - reserved))
+
+    # Ensure minimum and maximum bounds
+    if [[ $available -lt 1 ]]; then
+        echo 1
+    elif [[ $available -gt 50 ]]; then
+        echo 50
+    else
+        echo "$available"
+    fi
+}
+
 # Parse CSV into newline list (Bash 3.2)
 _pm_parse_csv_to_array() {
     local csv="${1:-}"
@@ -44,7 +82,7 @@ paginated_multi_select() {
     fi
 
     local total_items=${#items[@]}
-    local items_per_page=15
+    local items_per_page=$(_pm_calculate_items_per_page)
     local cursor_pos=0
     local top_index=0
     local filter_query=""
@@ -336,6 +374,9 @@ paginated_multi_select() {
 
     # Draw the complete menu
     draw_menu() {
+        # Recalculate items_per_page dynamically to handle window resize
+        items_per_page=$(_pm_calculate_items_per_page)
+
         printf "\033[H" >&2
         local clear_line="\r\033[2K"
 
@@ -353,28 +394,28 @@ paginated_multi_select() {
         if [[ $visible_total -eq 0 ]]; then
             if [[ "$filter_mode" == "true" ]]; then
                 # While editing: do not show "No items available"
-                for ((i = 0; i < items_per_page + 2; i++)); do
+                for ((i = 0; i < items_per_page; i++)); do
                     printf "${clear_line}\n" >&2
                 done
-                printf "${clear_line}${GRAY}Type to filter${NC}  ${GRAY}|${NC}  ${GRAY}Delete${NC} Backspace  ${GRAY}|${NC}  ${GRAY}Enter${NC} Apply  ${GRAY}|${NC}  ${GRAY}ESC${NC} Cancel\n" >&2
+                printf "${clear_line}${GRAY}Type to filter  |  Delete  |  Enter  |  / Exit  |  ESC${NC}\n" >&2
                 printf "${clear_line}" >&2
                 return
             else
                 if [[ "$searching" == "true" ]]; then
-                    printf "${clear_line}${GRAY}Searching…${NC}\n" >&2
-                    for ((i = 0; i < items_per_page + 2; i++)); do
+                    printf "${clear_line}Searching…\n" >&2
+                    for ((i = 0; i < items_per_page; i++)); do
                         printf "${clear_line}\n" >&2
                     done
-                    printf "${clear_line}${GRAY}${ICON_NAV_UP}/${ICON_NAV_DOWN}${NC} Nav  ${GRAY}|${NC}  ${GRAY}Space${NC} Select  ${GRAY}|${NC}  ${GRAY}Enter${NC} Confirm  ${GRAY}|${NC}  ${GRAY}/${NC} Filter  ${GRAY}|${NC}  ${GRAY}S${NC} Sort  ${GRAY}|${NC}  ${GRAY}Q${NC} Quit\n" >&2
+                    printf "${clear_line}${GRAY}${ICON_NAV_UP}${ICON_NAV_DOWN}  |  Space  |  Enter  |  / Filter  |  Q Exit${NC}\n" >&2
                     printf "${clear_line}" >&2
                     return
                 else
                     # Post-search: truly empty list
-                    printf "${clear_line}${GRAY}No items available${NC}\n" >&2
-                    for ((i = 0; i < items_per_page + 2; i++)); do
+                    printf "${clear_line}No items available\n" >&2
+                    for ((i = 0; i < items_per_page; i++)); do
                         printf "${clear_line}\n" >&2
                     done
-                    printf "${clear_line}${GRAY}${ICON_NAV_UP}/${ICON_NAV_DOWN}${NC} Nav  ${GRAY}|${NC}  ${GRAY}Space${NC} Select  ${GRAY}|${NC}  ${GRAY}Enter${NC} Confirm  ${GRAY}|${NC}  ${GRAY}/${NC} Filter  ${GRAY}|${NC}  ${GRAY}S${NC} Sort  ${GRAY}|${NC}  ${GRAY}Q${NC} Quit\n" >&2
+                    printf "${clear_line}${GRAY}${ICON_NAV_UP}${ICON_NAV_DOWN}  |  Space  |  Enter  |  / Filter  |  Q Exit${NC}\n" >&2
                     printf "${clear_line}" >&2
                     return
                 fi
@@ -419,56 +460,70 @@ paginated_multi_select() {
             name) sort_label="Name" ;;
             size) sort_label="Size" ;;
         esac
-        local arrow="↑"
-        [[ "$sort_reverse" == "true" ]] && arrow="↓"
-        local sort_status="${sort_label} ${arrow}"
+        local sort_status="${sort_label}"
 
         local filter_status=""
         if [[ "$filter_mode" == "true" ]]; then
-            filter_status="${YELLOW}${filter_query:-}${NC}"
+            filter_status="${filter_query:-_}"
         elif [[ -n "$applied_query" ]]; then
-            filter_status="${GREEN}${applied_query}${NC}"
+            filter_status="${applied_query}"
         else
-            filter_status="${GRAY}—${NC}"
+            filter_status="—"
         fi
 
-        # Footer with two lines: basic controls and advanced options
+        # Footer: single line with controls
         local sep="  ${GRAY}|${NC}  "
         if [[ "$filter_mode" == "true" ]]; then
-            # Filter mode: single line with all filter controls
+            # Filter mode: simple controls without sort
             local -a _segs_filter=(
-                "${GRAY}Filter Input:${NC} ${filter_status}"
-                "${GRAY}Delete${NC} Back"
-                "${GRAY}Enter${NC} Apply"
-                "${GRAY}/${NC} Clear"
-                "${GRAY}ESC${NC} Cancel"
+                "${GRAY}Filter: ${filter_status}${NC}"
+                "${GRAY}Delete${NC}"
+                "${GRAY}Enter${NC}"
+                "${GRAY}/ Exit${NC}"
+                "${GRAY}ESC${NC}"
             )
             _print_wrapped_controls "$sep" "${_segs_filter[@]}"
         else
-            # Normal mode
+            # Normal mode - single line compact format
+            local reverse_arrow="↑"
+            [[ "$sort_reverse" == "true" ]] && reverse_arrow="↓"
+
+            # Determine filter text based on whether filter is active
+            local filter_text="/ Filter"
+            [[ -n "$applied_query" ]] && filter_text="/ Clear"
+
             if [[ "$has_metadata" == "true" ]]; then
-                # With metadata: two lines (basic + advanced)
-                local -a _segs_basic=(
-                    "${GRAY}${ICON_NAV_UP}/${ICON_NAV_DOWN}${NC} Navigate"
-                    "${GRAY}Space${NC} Select"
-                    "${GRAY}Enter${NC} Confirm"
-                    "${GRAY}Q${NC} Quit"
-                )
-                _print_wrapped_controls "$sep" "${_segs_basic[@]}"
-                local -a _segs_advanced=(
-                    "${GRAY}S${NC} ${sort_status}"
-                    "${GRAY}R${NC} Reverse"
-                    "${GRAY}/${NC} Filter"
-                )
-                _print_wrapped_controls "$sep" "${_segs_advanced[@]}"
+                if [[ -n "$applied_query" ]]; then
+                    # Filtering: hide sort controls
+                    local -a _segs_all=(
+                        "${GRAY}${ICON_NAV_UP}${ICON_NAV_DOWN}${NC}"
+                        "${GRAY}Space${NC}"
+                        "${GRAY}Enter${NC}"
+                        "${GRAY}${filter_text}${NC}"
+                        "${GRAY}Q Exit${NC}"
+                    )
+                    _print_wrapped_controls "$sep" "${_segs_all[@]}"
+                else
+                    # Normal: show full controls
+                    local -a _segs_all=(
+                        "${GRAY}${ICON_NAV_UP}${ICON_NAV_DOWN}${NC}"
+                        "${GRAY}Space${NC}"
+                        "${GRAY}Enter${NC}"
+                        "${GRAY}${filter_text}${NC}"
+                        "${GRAY}S ${sort_status}${NC}"
+                        "${GRAY}R ${reverse_arrow}${NC}"
+                        "${GRAY}Q Exit${NC}"
+                    )
+                    _print_wrapped_controls "$sep" "${_segs_all[@]}"
+                fi
             else
-                # Without metadata: single line (basic only)
+                # Without metadata: basic controls
                 local -a _segs_simple=(
-                    "${GRAY}${ICON_NAV_UP}/${ICON_NAV_DOWN}${NC} Navigate"
-                    "${GRAY}Space${NC} Select"
-                    "${GRAY}Enter${NC} Confirm"
-                    "${GRAY}/${NC} Filter"
-                    "${GRAY}Q${NC} Quit"
+                    "${GRAY}${ICON_NAV_UP}${ICON_NAV_DOWN}${NC}"
+                    "${GRAY}Space${NC}"
+                    "${GRAY}Enter${NC}"
+                    "${GRAY}${filter_text}${NC}"
+                    "${GRAY}Q Exit${NC}"
                 )
                 _print_wrapped_controls "$sep" "${_segs_simple[@]}"
             fi
@@ -479,8 +534,6 @@ paginated_multi_select() {
     # Main interaction loop
     while true; do
         draw_menu
-        # Drain any pending input to prevent mouse wheel scroll issues
-        drain_pending_input
         local key
         key=$(read_key)
 
@@ -568,13 +621,23 @@ paginated_multi_select() {
                 fi
                 ;;
             "FILTER")
-                # Trigger filter mode with /
-                filter_mode="true"
-                export MOLE_READ_KEY_FORCE_CHAR=1
-                filter_query=""
-                top_index=0
-                cursor_pos=0
-                rebuild_view
+                # / key: toggle between filter and return
+                if [[ -n "$applied_query" ]]; then
+                    # Already filtering, clear and return to full list
+                    applied_query=""
+                    filter_query=""
+                    top_index=0
+                    cursor_pos=0
+                    rebuild_view
+                else
+                    # Enter filter mode
+                    filter_mode="true"
+                    export MOLE_READ_KEY_FORCE_CHAR=1
+                    filter_query=""
+                    top_index=0
+                    cursor_pos=0
+                    rebuild_view
+                fi
                 ;;
             "CHAR:f" | "CHAR:F")
                 if [[ "$filter_mode" == "true" ]]; then
@@ -603,9 +666,12 @@ paginated_multi_select() {
             CHAR:*)
                 if [[ "$filter_mode" == "true" ]]; then
                     local ch="${key#CHAR:}"
-                    # Special handling for /: clear filter
+                    # Special handling for /: exit filter mode
                     if [[ "$ch" == "/" ]]; then
+                        filter_mode="false"
+                        unset MOLE_READ_KEY_FORCE_CHAR
                         filter_query=""
+                        applied_query=""
                         rebuild_view
                     # avoid accidental leading spaces
                     elif [[ -n "$filter_query" || "$ch" != " " ]]; then
@@ -667,10 +733,11 @@ paginated_multi_select() {
                 restore_terminal
                 return 0
                 ;;
-            "HELP")
-                # Removed help screen, users can explore the interface
-                ;;
         esac
+
+        # Drain any accumulated input after processing (e.g., mouse wheel events)
+        # This prevents buffered events from causing jumps, without blocking keyboard input
+        drain_pending_input
     done
 }
 

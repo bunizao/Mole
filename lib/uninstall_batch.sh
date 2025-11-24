@@ -60,7 +60,6 @@ batch_uninstall_applications() {
     local -a app_details=()
     local -a dock_cleanup_paths=()
 
-    echo ""
     # Silent analysis without spinner output (avoid visual flicker)
     for selected_app in "${selected_apps[@]}"; do
         [[ -z "$selected_app" ]] && continue
@@ -94,6 +93,7 @@ batch_uninstall_applications() {
     local size_display=$(bytes_to_human "$((total_estimated_size * 1024))")
 
     # Display detailed file list for each app before confirmation
+    echo ""
     echo -e "${PURPLE}Files to be removed:${NC}"
     echo ""
     for detail in "${app_details[@]}"; do
@@ -132,10 +132,11 @@ batch_uninstall_applications() {
     local removal_note="Remove ${app_total} ${app_text}"
     [[ -n "$size_display" ]] && removal_note+=" (${size_display})"
     if [[ ${#running_apps[@]} -gt 0 ]]; then
-        removal_note+=" - will force quit: ${running_apps[*]}"
+        removal_note+=" ${YELLOW}[Running]${NC}"
     fi
-    echo -ne "${PURPLE}${ICON_ARROW}${NC} ${removal_note}. Press ${GREEN}Enter${NC} to confirm, ${GRAY}ESC${NC} to cancel: "
+    echo -ne "${PURPLE}${ICON_ARROW}${NC} ${removal_note}  ${GREEN}Enter${NC} confirm, ${GRAY}ESC${NC} cancel: "
 
+    drain_pending_input # Clean up any pending input before confirmation
     IFS= read -r -s -n1 key || key=""
     drain_pending_input # Clean up any escape sequence remnants
     case "$key" in
@@ -314,6 +315,12 @@ batch_uninstall_applications() {
         kill "$sudo_keepalive_pid" 2> /dev/null || true
         wait "$sudo_keepalive_pid" 2> /dev/null || true
         sudo_keepalive_pid=""
+    fi
+
+    # Invalidate cache if any apps were successfully uninstalled
+    if [[ $success_count -gt 0 ]]; then
+        local cache_file="$HOME/.cache/mole/app_scan_cache"
+        rm -f "$cache_file" 2> /dev/null || true
     fi
 
     ((total_size_cleaned += total_size_freed))

@@ -20,6 +20,8 @@ declare -a DEFAULT_WHITELIST_PATTERNS=(
     "$HOME/.ollama/models/*"
     "$HOME/Library/Caches/com.nssurge.surge-mac/*"
     "$HOME/Library/Application Support/com.nssurge.surge-mac/*"
+    "$HOME/Library/Caches/org.R-project.R/R/renv/*"
+    "FINDER_METADATA"
 )
 
 # Save whitelist patterns to config
@@ -30,7 +32,7 @@ save_whitelist_patterns() {
 
     cat > "$WHITELIST_CONFIG" << 'EOF'
 # Mole Whitelist - Protected paths won't be deleted
-# Default protections: Playwright browsers, HuggingFace models, Maven repo, Ollama models, Surge Mac
+# Default protections: Playwright browsers, HuggingFace models, Maven repo, Ollama models, Surge Mac, R renv, Finder metadata
 # Add one pattern per line to keep items safe.
 EOF
 
@@ -81,6 +83,7 @@ Bazel build cache|$HOME/.cache/bazel/*|compiler_cache
 Go build cache and module cache|$HOME/Library/Caches/go-build/*|compiler_cache
 Go module cache|$HOME/go/pkg/mod/cache/*|compiler_cache
 Rust Cargo registry cache|$HOME/.cargo/registry/cache/*|compiler_cache
+Rust documentation cache|$HOME/.rustup/toolchains/*/share/doc/*|compiler_cache
 Rustup toolchain downloads|$HOME/.rustup/downloads/*|compiler_cache
 ccache compiler cache|$HOME/.ccache/*|compiler_cache
 sccache distributed compiler cache|$HOME/.cache/sccache/*|compiler_cache
@@ -102,6 +105,7 @@ CocoaPods cache (iOS dependencies)|$HOME/Library/Caches/CocoaPods/*|package_mana
 npm package cache|$HOME/.npm/_cacache/*|package_manager
 pip Python package cache|$HOME/.cache/pip/*|package_manager
 uv Python package cache|$HOME/.cache/uv/*|package_manager
+R renv global cache (virtual environments)|$HOME/Library/Caches/org.R-project.R/R/renv/*|package_manager
 Homebrew downloaded packages|$HOME/Library/Caches/Homebrew/*|package_manager
 Yarn package manager cache|$HOME/.cache/yarn/*|package_manager
 pnpm package store|$HOME/.pnpm-store/*|package_manager
@@ -127,6 +131,7 @@ Podman container cache|$HOME/.local/share/containers/cache/*|container_cache
 Font cache|$HOME/Library/Caches/com.apple.FontRegistry/*|system_cache
 Spotlight metadata cache|$HOME/Library/Caches/com.apple.spotlight/*|system_cache
 CloudKit cache|$HOME/Library/Caches/CloudKit/*|system_cache
+Finder metadata (.DS_Store)|FINDER_METADATA|system_cache
 EOF
 }
 
@@ -197,12 +202,6 @@ manage_whitelist() {
 }
 
 manage_whitelist_categories() {
-    clear
-    echo ""
-    echo -e "${PURPLE}Whitelist Manager${NC}"
-    echo ""
-    echo ""
-
     # Load currently enabled patterns from both sources
     load_whitelist
 

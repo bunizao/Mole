@@ -243,22 +243,31 @@ create_raycast_commands() {
         write_raycast_script "$dir/mole-uninstall.sh" "uninstall" "$mo_bin" "uninstall"
         write_raycast_script "$dir/mole-optimize.sh" "optimize" "$mo_bin" "optimize"
         write_raycast_script "$dir/mole-analyze.sh" "analyze" "$mo_bin" "analyze"
+        write_raycast_script "$dir/mole-status.sh" "status" "$mo_bin" "status"
         log_success "Scripts ready in: $dir"
     done
 
+    echo ""
     if open "raycast://extensions/script-commands" > /dev/null 2>&1; then
-        log_step "Raycast settings opened. Run 'Reload Script Directories'."
+        log_step "Raycast settings opened."
     else
-        log_warn "Could not auto-open Raycast. Open it manually to reload scripts."
+        log_warn "Could not auto-open Raycast."
     fi
+
+    echo ""
+    echo "Next steps to activate Raycast commands:"
+    echo "  1. Open Raycast (⌘ Space)"
+    echo "  2. Search for 'Reload Script Directories'"
+    echo "  3. Press Enter to load new commands"
 }
 
 uuid() {
     if command -v uuidgen > /dev/null 2>&1; then
         uuidgen
     else
-        # Fallback pseudo UUID
-        openssl rand -hex 16 | sed 's/\(..\)/\1/g' | cut -c1-32
+        # Fallback pseudo UUID in format: 8-4-4-4-12
+        local hex=$(openssl rand -hex 16)
+        echo "${hex:0:8}-${hex:8:4}-${hex:12:4}-${hex:16:4}-${hex:20:12}"
     fi
 }
 
@@ -278,6 +287,7 @@ create_alfred_workflow() {
         "fun.tw93.mole.uninstall|Mole uninstall|uninstall|Uninstall apps via Mole|\"${mo_bin}\" uninstall"
         "fun.tw93.mole.optimize|Mole optimize|optimize|System health & optimization|\"${mo_bin}\" optimize"
         "fun.tw93.mole.analyze|Mole analyze|analyze|Disk space analysis|\"${mo_bin}\" analyze"
+        "fun.tw93.mole.status|Mole status|status|Live system dashboard|\"${mo_bin}\" status"
     )
 
     for entry in "${workflows[@]}"; do
@@ -392,12 +402,12 @@ main() {
     create_alfred_workflow "$mo_bin"
 
     echo ""
-    log_success "Done! Raycast and Alfred are ready with 4 commands:"
+    log_success "Done! Raycast and Alfred are ready with 5 commands:"
     echo "  • clean - Deep system cleanup"
     echo "  • uninstall - Remove applications"
     echo "  • optimize - System health & tuning"
     echo "  • analyze - Disk space explorer"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  • status - Live system monitor"
     echo ""
 }
 

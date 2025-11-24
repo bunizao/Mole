@@ -15,6 +15,7 @@ source "$SCRIPT_DIR/../lib/common.sh"
 # Configuration
 SYSTEM_CLEAN=false
 DRY_RUN=false
+PROTECT_FINDER_METADATA=false
 IS_M_SERIES=$([[ "$(uname -m)" == "arm64" ]] && echo "true" || echo "false")
 
 # Constants
@@ -22,12 +23,32 @@ readonly MAX_PARALLEL_JOBS=15 # Maximum parallel background jobs
 readonly TEMP_FILE_AGE_DAYS=7 # Age threshold for temp file cleanup
 readonly ORPHAN_AGE_DAYS=60   # Age threshold for orphaned data
 
+# Timeout helper (GNU timeout isn't available on stock macOS)
+TIMEOUT_BIN=""
+for candidate in gtimeout timeout; do
+    if command -v "$candidate" > /dev/null 2>&1; then
+        TIMEOUT_BIN="$candidate"
+        break
+    fi
+done
+
+run_with_timeout() {
+    local duration="$1"
+    shift
+    if [[ -n "$TIMEOUT_BIN" ]]; then
+        "$TIMEOUT_BIN" "$duration" "$@"
+    else
+        "$@"
+    fi
+}
+
 # Protected Service Worker domains (web-based editing tools)
 readonly PROTECTED_SW_DOMAINS=(
     "capcut.com"
     "photopea.com"
     "pixlr.com"
 )
+readonly FINDER_METADATA_SENTINEL="FINDER_METADATA"
 # Default whitelist patterns (preselected, user can disable)
 declare -a DEFAULT_WHITELIST_PATTERNS=(
     "$HOME/Library/Caches/ms-playwright*"
@@ -36,6 +57,8 @@ declare -a DEFAULT_WHITELIST_PATTERNS=(
     "$HOME/.ollama/models/*"
     "$HOME/Library/Caches/com.nssurge.surge-mac/*"
     "$HOME/Library/Application Support/com.nssurge.surge-mac/*"
+    "$HOME/Library/Caches/org.R-project.R/R/renv/*"
+    "$FINDER_METADATA_SENTINEL"
 )
 declare -a WHITELIST_PATTERNS=()
 WHITELIST_WARNINGS=()
@@ -53,9 +76,9 @@ if [[ -f "$HOME/.config/mole/whitelist" ]]; then
         # Expand tilde to home directory
         [[ "$line" == ~* ]] && line="${line/#~/$HOME}"
 
-        # Stricter path validation (no spaces, wildcards only at end)
-        # Allow: letters, numbers, /, _, ., -, @ and * only at the end
-        if [[ ! "$line" =~ ^[a-zA-Z0-9/_.@-]+(\*)?$ ]]; then
+        # Path validation with support for spaces and wildcards
+        # Allow: letters, numbers, /, _, ., -, @, spaces, and * anywhere in path
+        if [[ ! "$line" =~ ^[a-zA-Z0-9/_.@\ *-]+$ ]]; then
             WHITELIST_WARNINGS+=("Invalid path format: $line")
             continue
         fi
@@ -88,6 +111,15 @@ if [[ -f "$HOME/.config/mole/whitelist" ]]; then
     done < "$HOME/.config/mole/whitelist"
 else
     WHITELIST_PATTERNS=("${DEFAULT_WHITELIST_PATTERNS[@]}")
+fi
+
+if [[ ${#WHITELIST_PATTERNS[@]} -gt 0 ]]; then
+    for entry in "${WHITELIST_PATTERNS[@]}"; do
+        if [[ "$entry" == "$FINDER_METADATA_SENTINEL" ]]; then
+            PROTECT_FINDER_METADATA=true
+            break
+        fi
+    done
 fi
 total_items=0
 
@@ -209,7 +241,7 @@ start_section() {
 
 end_section() {
     if [[ $TRACK_SECTION -eq 1 && $SECTION_ACTIVITY -eq 0 ]]; then
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Nothing to tidy"
+        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Nothing to clean"
     fi
     TRACK_SECTION=0
 }
@@ -241,6 +273,18 @@ safe_clean() {
     local -a existing_paths=()
     for path in "${targets[@]}"; do
         local skip=false
+
+        # Hard-coded protection for critical apps (cannot be disabled by user)
+        case "$path" in
+            *clash* | *Clash* | *surge* | *Surge* | *mihomo* | *openvpn* | *OpenVPN*)
+                skip=true
+                ((skipped_count++))
+                ;;
+        esac
+
+        [[ "$skip" == "true" ]] && continue
+
+        # Check user-defined whitelist
         if [[ ${#WHITELIST_PATTERNS[@]} -gt 0 ]]; then
             for w in "${WHITELIST_PATTERNS[@]}"; do
                 # Match both exact path and glob pattern
@@ -315,7 +359,12 @@ safe_clean() {
                 read -r size count < "$result_file" 2> /dev/null || true
                 if [[ "$count" -gt 0 && "$size" -gt 0 ]]; then
                     if [[ "$DRY_RUN" != "true" ]]; then
-                        rm -rf "$path" 2> /dev/null || true
+                        # Handle symbolic links separately (only remove the link, not the target)
+                        if [[ -L "$path" ]]; then
+                            rm "$path" 2> /dev/null || true
+                        else
+                            rm -rf "$path" 2> /dev/null || true
+                        fi
                     fi
                     ((total_size_bytes += size))
                     ((total_count += count))
@@ -339,7 +388,12 @@ safe_clean() {
 
             if [[ "$count" -gt 0 && "$size_bytes" -gt 0 ]]; then
                 if [[ "$DRY_RUN" != "true" ]]; then
-                    rm -rf "$path" 2> /dev/null || true
+                    # Handle symbolic links separately (only remove the link, not the target)
+                    if [[ -L "$path" ]]; then
+                        rm "$path" 2> /dev/null || true
+                    else
+                        rm -rf "$path" 2> /dev/null || true
+                    fi
                 fi
                 ((total_size_bytes += size_bytes))
                 ((total_count += count))
@@ -452,14 +506,13 @@ start_cleanup() {
     clear
     printf '\n'
     echo -e "${PURPLE}Clean Your Mac${NC}"
+    echo ""
 
     if [[ "$DRY_RUN" != "true" && -t 0 ]]; then
-        echo ""
-        echo -e "${YELLOW}Tip:${NC} Safety first—run 'mo clean --dry-run'. Important Macs should stop."
+        echo -e "${YELLOW}☻${NC} First time? Run ${GRAY}mo clean --dry-run${NC} first to preview changes"
     fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo ""
         echo -e "${YELLOW}Dry Run Mode${NC} - Preview only, no deletions"
         echo ""
         SYSTEM_CLEAN=false
@@ -467,7 +520,6 @@ start_cleanup() {
     fi
 
     if [[ -t 0 ]]; then
-        echo ""
         echo -ne "${PURPLE}${ICON_ARROW}${NC} System caches need sudo — ${GREEN}Enter${NC} continue, ${GRAY}Space${NC} skip: "
 
         # Use read_key to properly handle all key inputs
@@ -586,6 +638,53 @@ clean_service_worker_cache() {
 perform_cleanup() {
     echo -e "${BLUE}${ICON_ADMIN}${NC} $(detect_architecture) | Free space: $(get_free_space)"
 
+    # Pre-check permissions to trigger all TCC dialogs at once (iTerm2/Terminal)
+    # This prevents permission dialogs from appearing randomly throughout the cleanup
+    # Only run this check once per installation
+    local permission_flag="$HOME/.cache/mole/permissions_granted"
+
+    if [[ -t 1 && ! -f "$permission_flag" ]]; then
+        # Key protected directories that require TCC approval
+        local -a tcc_dirs=(
+            "$HOME/Library/Caches"
+            "$HOME/Library/Logs"
+            "$HOME/Library/Application Support"
+            "$HOME/Library/Containers"
+            "$HOME/.cache"
+        )
+
+        # Quick permission test - if first directory is accessible, likely others are too
+        # Use simple ls test instead of find to avoid triggering permission dialogs prematurely
+        local needs_permission_check=false
+        if ! ls "$HOME/Library/Caches" > /dev/null 2>&1; then
+            needs_permission_check=true
+        fi
+
+        if [[ "$needs_permission_check" == "true" ]]; then
+            echo ""
+            echo -e "${BLUE}First-time setup${NC}"
+            echo -e "${GRAY}macOS will request permissions to access Library folders.${NC}"
+            echo -e "${GRAY}You may see ${GREEN}${#tcc_dirs[@]} permission dialogs${NC}${GRAY} - please approve them all.${NC}"
+            echo ""
+            echo -ne "${PURPLE}${ICON_ARROW}${NC} Press ${GREEN}Enter${NC} to continue: "
+            read -r
+
+            MOLE_SPINNER_PREFIX="" start_inline_spinner "Requesting permissions..."
+
+            # Trigger all TCC prompts upfront
+            for dir in "${tcc_dirs[@]}"; do
+                [[ -d "$dir" ]] && find "$dir" -maxdepth 1 -type d > /dev/null 2>&1
+            done
+
+            stop_inline_spinner
+            echo ""
+        fi
+
+        # Mark permissions as granted (won't prompt again)
+        mkdir -p "$(dirname "$permission_flag")" 2>/dev/null || true
+        touch "$permission_flag" 2>/dev/null || true
+    fi
+
     # Show whitelist info if patterns are active
     local active_count=${#WHITELIST_PATTERNS[@]}
     if [[ $active_count -gt 2 ]]; then
@@ -604,10 +703,10 @@ perform_cleanup() {
     if [[ "$SYSTEM_CLEAN" == "true" ]]; then
         start_section "Deep system"
 
-        # Clean system caches more safely
-        sudo find /Library/Caches -name "*.cache" -delete 2> /dev/null || true
-        sudo find /Library/Caches -name "*.tmp" -delete 2> /dev/null || true
-        sudo find /Library/Caches -type f -name "*.log" -delete 2> /dev/null || true
+        # Clean system caches more safely (only old files to avoid breaking running apps)
+        sudo find /Library/Caches -name "*.cache" -mtime +7 -delete 2> /dev/null || true
+        sudo find /Library/Caches -name "*.tmp" -mtime +7 -delete 2> /dev/null || true
+        sudo find /Library/Caches -type f -name "*.log" -mtime +30 -delete 2> /dev/null || true
 
         # Clean old temp files only (avoid breaking running processes)
         local tmp_cleaned=0
@@ -623,8 +722,93 @@ perform_cleanup() {
         fi
         [[ $tmp_cleaned -eq 1 ]] && log_success "Old system temp files (${TEMP_FILE_AGE_DAYS}+ days)"
 
+        # Clean system crash reports and diagnostics
+        sudo find /Library/Logs/DiagnosticReports -type f -mtime +30 -delete 2> /dev/null || true
+        sudo find /Library/Logs/CrashReporter -type f -mtime +30 -delete 2> /dev/null || true
+        log_success "Old system crash reports (30+ days)"
+
+        # Clean old system logs (keep recent ones for troubleshooting)
+        sudo find /var/log -name "*.log" -type f -mtime +30 -delete 2> /dev/null || true
+        sudo find /var/log -name "*.gz" -type f -mtime +30 -delete 2> /dev/null || true
+        log_success "Old system logs (30+ days)"
+
         sudo rm -rf /Library/Updates/* 2> /dev/null || true
         log_success "System library caches and updates"
+
+        # Clean up orphaned cask records (apps manually deleted) while sudo is fresh
+        if command -v brew > /dev/null 2>&1; then
+            if [[ -t 1 ]]; then MOLE_SPINNER_PREFIX="  " start_inline_spinner "Scanning orphaned casks..."; fi
+
+            local cache_dir="$HOME/.cache/mole"
+            local cask_cache="$cache_dir/cask_apps.cache"
+            local use_cache=false
+
+            # Check if cache is valid (less than 2 days old)
+            if [[ -f "$cask_cache" ]]; then
+                local cache_age=$(( $(date +%s) - $(stat -f%m "$cask_cache") ))
+                if [[ $cache_age -lt 172800 ]]; then
+                    use_cache=true
+                fi
+            fi
+
+            local orphaned_casks=()
+            if [[ "$use_cache" == "true" ]]; then
+                # Use cached cask → app mapping
+                while IFS='|' read -r cask app_name; do
+                    [[ ! -e "/Applications/$app_name" ]] && orphaned_casks+=("$cask")
+                done < "$cask_cache"
+            else
+                # Rebuild cache
+                mkdir -p "$cache_dir"
+                > "$cask_cache"
+
+                while IFS= read -r cask; do
+                    # Get app path from cask info
+                    local cask_info
+                    cask_info=$(brew info --cask "$cask" 2>/dev/null || true)
+
+                    # Extract app name from "AppName.app (App)" format
+                    local app_name
+                    app_name=$(echo "$cask_info" | grep -E '\.app \(App\)' | head -1 | sed -E 's/^[[:space:]]*//' | sed -E 's/ \(App\).*//' || true)
+
+                    # Skip if no app artifact (might be a utility package)
+                    [[ -z "$app_name" ]] && continue
+
+                    # Save to cache
+                    echo "$cask|$app_name" >> "$cask_cache"
+
+                    # Check if app exists
+                    [[ ! -e "/Applications/$app_name" ]] && orphaned_casks+=("$cask")
+                done < <(brew list --cask 2>/dev/null || true)
+            fi
+
+            # Remove orphaned casks if found
+            if [[ ${#orphaned_casks[@]} -gt 0 ]]; then
+                # Check if sudo session is still valid (without prompting)
+                if sudo -n true 2>/dev/null; then
+                    if [[ -t 1 ]]; then
+                        stop_inline_spinner
+                        MOLE_SPINNER_PREFIX="  " start_inline_spinner "Cleaning orphaned casks..."
+                    fi
+
+                    local removed_casks=0
+                    for cask in "${orphaned_casks[@]}"; do
+                        if brew uninstall --cask "$cask" --force > /dev/null 2>&1; then
+                            ((removed_casks++))
+                        fi
+                    done
+
+                    if [[ -t 1 ]]; then stop_inline_spinner; fi
+
+                    [[ $removed_casks -gt 0 ]] && log_success "Orphaned Homebrew casks ($removed_casks apps)"
+                else
+                    if [[ -t 1 ]]; then stop_inline_spinner; fi
+                    echo -e "  ${YELLOW}${ICON_WARNING}${NC} Found ${#orphaned_casks[@]} orphaned casks (sudo expired, run ${GRAY}brew list --cask${NC} to check)"
+                fi
+            else
+                if [[ -t 1 ]]; then stop_inline_spinner; fi
+            fi
+        fi
 
         end_section
     fi
@@ -678,23 +862,36 @@ perform_cleanup() {
     safe_clean ~/Downloads/*.download "Incomplete downloads (Safari)"
     safe_clean ~/Downloads/*.crdownload "Incomplete downloads (Chrome)"
     safe_clean ~/Downloads/*.part "Incomplete downloads (partial)"
+
+    # Additional user-level caches (commonly missed)
+    safe_clean ~/Library/Autosave\ Information/* "Autosave information"
+    safe_clean ~/Library/IdentityCaches/* "Identity caches"
+    safe_clean ~/Library/Suggestions/* "Suggestions cache (Siri)"
+    safe_clean ~/Library/Calendars/Calendar\ Cache "Calendar cache"
+    safe_clean ~/Library/Application\ Support/AddressBook/Sources/*/Photos.cache "Address Book photo cache"
     end_section
 
     start_section "Finder metadata"
-    clean_ds_store_tree "$HOME" "Home directory (.DS_Store)"
+    if [[ "$PROTECT_FINDER_METADATA" == "true" ]]; then
+        note_activity
+        echo -e "  ${YELLOW}☻${NC} Finder metadata protected by whitelist"
+        echo -e "  ${YELLOW}☻${NC} Run ${GRAY}mo clean --whitelist${NC} to allow cleaning .DS_Store files"
+    else
+        clean_ds_store_tree "$HOME" "Home directory (.DS_Store)"
 
-    if [[ -d "/Volumes" ]]; then
-        for volume in /Volumes/*; do
-            [[ -d "$volume" && -w "$volume" ]] || continue
+        if [[ -d "/Volumes" ]]; then
+            for volume in /Volumes/*; do
+                [[ -d "$volume" && -w "$volume" ]] || continue
 
-            local fs_type=""
-            fs_type=$(df -T "$volume" 2> /dev/null | tail -1 | awk '{print $2}')
-            case "$fs_type" in
-                nfs | smbfs | afpfs | cifs | webdav) continue ;;
-            esac
+                local fs_type=""
+                fs_type=$(df -T "$volume" 2> /dev/null | tail -1 | awk '{print $2}')
+                case "$fs_type" in
+                    nfs | smbfs | afpfs | cifs | webdav) continue ;;
+                esac
 
-            clean_ds_store_tree "$volume" "$(basename "$volume") volume (.DS_Store)"
-        done
+                clean_ds_store_tree "$volume" "$(basename "$volume") volume (.DS_Store)"
+            done
+        fi
     fi
     end_section
 
@@ -723,6 +920,7 @@ perform_cleanup() {
     safe_clean ~/Library/Containers/com.apple.wallpaper.agent/Data/Library/Caches/* "Wallpaper agent cache"
     safe_clean ~/Library/Containers/com.apple.mediaanalysisd/Data/Library/Caches/* "Media analysis cache"
     safe_clean ~/Library/Containers/com.apple.AppStore/Data/Library/Caches/* "App Store cache"
+    safe_clean ~/Library/Containers/com.apple.configurator.xpc.InternetService/Data/tmp/* "Apple Configurator temp files"
     safe_clean ~/Library/Containers/*/Data/Library/Caches/* "Sandboxed app caches"
     end_section
 
@@ -800,6 +998,8 @@ perform_cleanup() {
 
     safe_clean ~/.npm/_cacache/* "npm cache directory"
     safe_clean ~/.npm/_logs/* "npm logs"
+    safe_clean ~/.tnpm/_cacache/* "tnpm cache directory"
+    safe_clean ~/.tnpm/_logs/* "tnpm logs"
     safe_clean ~/.yarn/cache/* "Yarn cache"
     safe_clean ~/.bun/install/cache/* "Bun cache"
 
@@ -849,49 +1049,71 @@ perform_cleanup() {
     safe_clean /usr/local/var/homebrew/locks/* "Homebrew lock files (Intel)"
     if command -v brew > /dev/null 2>&1; then
         if [[ "$DRY_RUN" != "true" ]]; then
-            if [[ -t 1 ]]; then MOLE_SPINNER_PREFIX="  " start_inline_spinner "Homebrew cleanup..."; fi
+            # Check if brew cleanup was run recently (within 2 days)
+            local brew_cache_file="${HOME}/.cache/mole/brew_last_cleanup"
+            local cache_valid_days=2
+            local should_skip=false
 
-            # Run brew cleanup with timeout (45 seconds max)
-            local brew_output=""
-            local brew_success=false
-            local timeout_seconds=60
-            local brew_tmp_file
+            if [[ -f "$brew_cache_file" ]]; then
+                local last_cleanup
+                last_cleanup=$(cat "$brew_cache_file" 2>/dev/null || echo "0")
+                local current_time
+                current_time=$(date +%s)
+                local time_diff=$((current_time - last_cleanup))
+                local days_diff=$((time_diff / 86400))
+
+                if [[ $days_diff -lt $cache_valid_days ]]; then
+                    should_skip=true
+                    echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Homebrew (cleaned ${days_diff}d ago, skipped)"
+                fi
+            fi
+
+            if [[ "$should_skip" == "false" ]]; then
+                if [[ -t 1 ]]; then MOLE_SPINNER_PREFIX="  " start_inline_spinner "Homebrew cleanup and autoremove..."; fi
+
+                local timeout_seconds=${MO_BREW_TIMEOUT:-120}
+
+            # Run brew cleanup and autoremove in parallel
+            local brew_tmp_file autoremove_tmp_file
             brew_tmp_file=$(create_temp_file)
+            autoremove_tmp_file=$(create_temp_file)
 
-            # Run brew cleanup in background with manual timeout
-            # Deep clean with -s --prune=all (1 minute timeout)
-            (brew cleanup -s --prune=all > "$brew_tmp_file" 2>&1) &
+            (brew cleanup > "$brew_tmp_file" 2>&1) &
             local brew_pid=$!
-            local elapsed=0
 
-            # Wait for completion or timeout
-            while kill -0 $brew_pid 2> /dev/null; do
+            (brew autoremove > "$autoremove_tmp_file" 2>&1) &
+            local autoremove_pid=$!
+
+            local elapsed=0
+            local brew_done=false
+            local autoremove_done=false
+
+            # Wait for both to complete or timeout
+            while [[ "$brew_done" == "false" ]] || [[ "$autoremove_done" == "false" ]]; do
                 if [[ $elapsed -ge $timeout_seconds ]]; then
-                    # Timeout reached - kill the process
-                    kill -TERM $brew_pid 2> /dev/null || true
-                    wait $brew_pid 2> /dev/null || true
+                    kill -TERM $brew_pid $autoremove_pid 2> /dev/null || true
                     break
                 fi
+
+                kill -0 $brew_pid 2> /dev/null || brew_done=true
+                kill -0 $autoremove_pid 2> /dev/null || autoremove_done=true
+
                 sleep 1
                 ((elapsed++))
             done
 
-            # Check if process completed successfully
-            wait $brew_pid 2> /dev/null && brew_success=true || true
+            # Wait for processes to finish
+            wait $brew_pid 2> /dev/null && local brew_success=true || local brew_success=false
+            wait $autoremove_pid 2> /dev/null && local autoremove_success=true || local autoremove_success=false
 
             if [[ -t 1 ]]; then stop_inline_spinner; fi
 
-            # Read output
-            if [[ -f "$brew_tmp_file" ]]; then
+            # Process cleanup output
+            if [[ "$brew_success" == "true" && -f "$brew_tmp_file" ]]; then
+                local brew_output
                 brew_output=$(cat "$brew_tmp_file" 2> /dev/null || echo "")
-            fi
-
-            if [[ "$brew_success" == "true" && $elapsed -lt $timeout_seconds ]]; then
-                # Show summary of what was cleaned
-                local removed_count
+                local removed_count freed_space
                 removed_count=$(printf '%s\n' "$brew_output" | grep -c "Removing:" 2> /dev/null || true)
-                removed_count="${removed_count:-0}"
-                local freed_space
                 freed_space=$(printf '%s\n' "$brew_output" | grep -o "[0-9.]*[KMGT]B freed" 2> /dev/null | tail -1 || true)
 
                 if [[ $removed_count -gt 0 ]] || [[ -n "$freed_space" ]]; then
@@ -900,15 +1122,33 @@ perform_cleanup() {
                     else
                         echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Homebrew cleanup (${removed_count} items)"
                     fi
-                else
-                    echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Homebrew cleanup"
                 fi
-            else
-                # Timeout or error occurred
-                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Homebrew cleanup timed out (run 'brew cleanup' manually)"
+            elif [[ $elapsed -ge $timeout_seconds ]]; then
+                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Homebrew cleanup timed out (run ${GRAY}brew cleanup${NC} manually)"
+            fi
+
+            # Process autoremove output - only show if packages were removed
+            if [[ "$autoremove_success" == "true" && -f "$autoremove_tmp_file" ]]; then
+                local autoremove_output
+                autoremove_output=$(cat "$autoremove_tmp_file" 2> /dev/null || echo "")
+                local removed_packages
+                removed_packages=$(printf '%s\n' "$autoremove_output" | grep -c "^Uninstalling" 2> /dev/null || true)
+
+                if [[ $removed_packages -gt 0 ]]; then
+                    echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Removed orphaned dependencies (${removed_packages} packages)"
+                fi
+            elif [[ $elapsed -ge $timeout_seconds ]]; then
+                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Autoremove timed out (run ${GRAY}brew autoremove${NC} manually)"
+            fi
+
+                # Update cache timestamp on successful completion
+                if [[ "$brew_success" == "true" || "$autoremove_success" == "true" ]]; then
+                    mkdir -p "$(dirname "$brew_cache_file")"
+                    date +%s > "$brew_cache_file"
+                fi
             fi
         else
-            echo -e "  ${YELLOW}→${NC} Homebrew (would cleanup)"
+            echo -e "  ${YELLOW}→${NC} Homebrew (would cleanup and autoremove)"
         fi
         note_activity
     fi
@@ -944,17 +1184,38 @@ perform_cleanup() {
         MOLE_SPINNER_PREFIX="  "
         start_inline_spinner "Searching Next.js caches..."
     fi
-    while IFS= read -r next_dir; do
-        if [[ -d "$next_dir/cache" ]]; then
-            safe_clean "$next_dir/cache"/* "Next.js build cache" || true
-        fi
-    done < <(
-        find "$HOME" -type d -name ".next" -maxdepth 4 \
+
+    # Use timeout to prevent hanging on problematic directories
+    local nextjs_tmp_file
+    nextjs_tmp_file=$(create_temp_file)
+    (
+        find "$HOME" -P -mount -type d -name ".next" -maxdepth 3 \
             -not -path "*/Library/*" \
             -not -path "*/.Trash/*" \
             -not -path "*/node_modules/*" \
+            -not -path "*/.*" \
             2> /dev/null || true
-    )
+    ) > "$nextjs_tmp_file" 2>&1 &
+    local find_pid=$!
+    local find_timeout=10
+    local elapsed=0
+
+    while kill -0 $find_pid 2>/dev/null && [[ $elapsed -lt $find_timeout ]]; do
+        sleep 1
+        ((elapsed++))
+    done
+
+    if kill -0 $find_pid 2>/dev/null; then
+        kill -TERM $find_pid 2>/dev/null || true
+        wait $find_pid 2>/dev/null || true
+    else
+        wait $find_pid 2>/dev/null || true
+    fi
+
+    while IFS= read -r next_dir; do
+        [[ -d "$next_dir/cache" ]] && safe_clean "$next_dir/cache"/* "Next.js build cache" || true
+    done < "$nextjs_tmp_file"
+
     if [[ -t 1 ]]; then
         stop_inline_spinner
     fi
@@ -964,15 +1225,38 @@ perform_cleanup() {
         MOLE_SPINNER_PREFIX="  "
         start_inline_spinner "Searching Python caches..."
     fi
-    while IFS= read -r pycache; do
-        safe_clean "$pycache"/* "Python bytecode cache" || true
-    done < <(
-        find "$HOME" -type d -name "__pycache__" -maxdepth 5 \
+
+    # Use timeout to prevent hanging on problematic directories
+    local pycache_tmp_file
+    pycache_tmp_file=$(create_temp_file)
+    (
+        find "$HOME" -P -mount -type d -name "__pycache__" -maxdepth 3 \
             -not -path "*/Library/*" \
             -not -path "*/.Trash/*" \
             -not -path "*/node_modules/*" \
+            -not -path "*/.*" \
             2> /dev/null || true
-    )
+    ) > "$pycache_tmp_file" 2>&1 &
+    local find_pid=$!
+    local find_timeout=10
+    local elapsed=0
+
+    while kill -0 $find_pid 2>/dev/null && [[ $elapsed -lt $find_timeout ]]; do
+        sleep 1
+        ((elapsed++))
+    done
+
+    if kill -0 $find_pid 2>/dev/null; then
+        kill -TERM $find_pid 2>/dev/null || true
+        wait $find_pid 2>/dev/null || true
+    else
+        wait $find_pid 2>/dev/null || true
+    fi
+
+    while IFS= read -r pycache; do
+        [[ -d "$pycache" ]] && safe_clean "$pycache"/* "Python bytecode cache" || true
+    done < "$pycache_tmp_file"
+
     if [[ -t 1 ]]; then
         stop_inline_spinner
     fi
@@ -1003,7 +1287,7 @@ perform_cleanup() {
     safe_clean ~/.rustup/toolchains/*/share/doc/* "Rust documentation cache"
     safe_clean ~/.rustup/downloads/* "Rust downloads cache"
     safe_clean ~/.gradle/caches/* "Gradle caches"
-    safe_clean ~/.m2/repository/* "Maven repository cache"
+    # Skip: Maven repository is not cache, it's dependency storage (protected by whitelist)
     safe_clean ~/.sbt/* "SBT cache"
     safe_clean ~/.docker/buildx/cache/* "Docker BuildX cache"
     safe_clean ~/.cache/terraform/* "Terraform cache"
@@ -1074,13 +1358,15 @@ perform_cleanup() {
     safe_clean ~/Library/Application\ Support/Code/Cache/* "VS Code cache"
     safe_clean ~/Library/Application\ Support/Code/CachedExtensions/* "VS Code extension cache"
     safe_clean ~/Library/Application\ Support/Code/CachedData/* "VS Code data cache"
-    safe_clean ~/Library/Logs/IntelliJIdea*/* "IntelliJ IDEA logs"
-    safe_clean ~/Library/Logs/PhpStorm*/* "PhpStorm logs"
-    safe_clean ~/Library/Logs/PyCharm*/* "PyCharm logs"
-    safe_clean ~/Library/Logs/WebStorm*/* "WebStorm logs"
-    safe_clean ~/Library/Logs/GoLand*/* "GoLand logs"
-    safe_clean ~/Library/Logs/CLion*/* "CLion logs"
-    safe_clean ~/Library/Logs/DataGrip*/* "DataGrip logs"
+    # Skip all JetBrains IDE logs to prevent potential data loss
+    # (User reported DataGrip connections were lost after cleaning logs)
+    # safe_clean ~/Library/Logs/IntelliJIdea*/* "IntelliJ IDEA logs"
+    # safe_clean ~/Library/Logs/PhpStorm*/* "PhpStorm logs"
+    # safe_clean ~/Library/Logs/PyCharm*/* "PyCharm logs"
+    # safe_clean ~/Library/Logs/WebStorm*/* "WebStorm logs"
+    # safe_clean ~/Library/Logs/GoLand*/* "GoLand logs"
+    # safe_clean ~/Library/Logs/CLion*/* "CLion logs"
+    # safe_clean ~/Library/Logs/DataGrip*/* "DataGrip logs"
     safe_clean ~/Library/Caches/JetBrains/* "JetBrains cache"
     safe_clean ~/Library/Application\ Support/discord/Cache/* "Discord cache"
     safe_clean ~/Library/Application\ Support/Slack/Cache/* "Slack cache"
@@ -1182,7 +1468,7 @@ perform_cleanup() {
     end_section
 
     # ===== 10. Virtualization tools =====
-    start_section "Virtualization tools"
+    start_section "Virtual machine tools"
     safe_clean ~/Library/Caches/com.vmware.fusion "VMware Fusion cache"
     safe_clean ~/Library/Caches/com.parallels.* "Parallels cache"
     safe_clean ~/VirtualBox\ VMs/.cache "VirtualBox cache"
@@ -1192,6 +1478,10 @@ perform_cleanup() {
     # ===== 11. Application Support logs cleanup =====
     start_section "Application Support logs"
 
+    # Check if we have permission to access Application Support
+    # Use simple ls test instead of find to avoid hanging
+    if [[ -d "$HOME/Library/Application Support" ]] && ls "$HOME/Library/Application Support" > /dev/null 2>&1; then
+
     # Clean log directories for apps that store logs in Application Support
     for app_dir in ~/Library/Application\ Support/*; do
         [[ -d "$app_dir" ]] || continue
@@ -1199,7 +1489,7 @@ perform_cleanup() {
 
         # Skip system and protected apps
         case "$app_name" in
-            com.apple.* | Adobe* | 1Password | Claude)
+            com.apple.* | Adobe* | JetBrains* | 1Password | Claude | *ClashX* | *clash* | mihomo* | *Surge* | iTerm* | *iterm* | Warp* | Kitty* | Alacritty* | WezTerm* | Ghostty*)
                 continue
                 ;;
         esac
@@ -1216,14 +1506,32 @@ perform_cleanup() {
         fi
     done
 
+    else
+        note_activity
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Skipped: No permission to access Application Support"
+    fi
+
     end_section
 
     # ===== 12. Orphaned app data cleanup =====
     # Only touch apps missing from scan + 60+ days inactive
     # Skip protected vendors, keep Preferences/Application Support
-    start_section "Orphaned app data"
+    start_section "Uninstalled app data"
 
-    local -r ORPHAN_AGE_THRESHOLD=60 # 2 months - good balance between safety and cleanup
+    # Check if we have permission to access Library folders
+    # Use simple ls test instead of find to avoid hanging
+    local has_library_access=true
+    if ! ls "$HOME/Library/Caches" > /dev/null 2>&1; then
+        has_library_access=false
+    fi
+
+    if [[ "$has_library_access" == "false" ]]; then
+        note_activity
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Skipped: No permission to access Library folders"
+        echo -e "  ${GRAY}Tip: Grant 'Full Disk Access' to iTerm2/Terminal in System Settings${NC}"
+    else
+
+    local -r ORPHAN_AGE_THRESHOLD=60 # 60 days - good balance between safety and cleanup
 
     # Build list of installed application bundle identifiers
     MOLE_SPINNER_PREFIX="  " start_inline_spinner "Scanning installed applications..."
@@ -1235,21 +1543,21 @@ perform_cleanup() {
         "$HOME/Applications"
     )
 
-    # Scan for .app bundles
+    # Scan for .app bundles with timeout protection
     for search_path in "${search_paths[@]}"; do
         [[ -d "$search_path" ]] || continue
         while IFS= read -r app; do
             [[ -f "$app/Contents/Info.plist" ]] || continue
             bundle_id=$(defaults read "$app/Contents/Info.plist" CFBundleIdentifier 2> /dev/null || echo "")
             [[ -n "$bundle_id" ]] && echo "$bundle_id" >> "$installed_bundles"
-        done < <(find "$search_path" -maxdepth 2 -type d -name "*.app" 2> /dev/null || true)
+        done < <(run_with_timeout 10 find "$search_path" -maxdepth 2 -type d -name "*.app" 2> /dev/null || true)
     done
 
-    # Get running applications and LaunchAgents
-    local running_apps=$(osascript -e 'tell application "System Events" to get bundle identifier of every application process' 2> /dev/null || echo "")
-    echo "$running_apps" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' >> "$installed_bundles"
+    # Get running applications and LaunchAgents with timeout protection
+    local running_apps=$(run_with_timeout 5 osascript -e 'tell application "System Events" to get bundle identifier of every application process' 2> /dev/null || echo "")
+    echo "$running_apps" | tr ',' '\n' | sed -e 's/^ *//;s/ *$//' -e '/^$/d' >> "$installed_bundles"
 
-    find ~/Library/LaunchAgents /Library/LaunchAgents \
+    run_with_timeout 5 find ~/Library/LaunchAgents /Library/LaunchAgents \
         -name "*.plist" -type f 2> /dev/null | while IFS= read -r plist; do
         basename "$plist" .plist
     done >> "$installed_bundles" 2> /dev/null || true
@@ -1295,12 +1603,14 @@ perform_cleanup() {
         esac
 
         # Check file age - only clean if 60+ days inactive
+        # Use modification time (mtime) instead of access time (atime)
+        # because macOS disables atime updates by default for performance
         if [[ -e "$directory_path" ]]; then
-            local last_access_epoch=$(stat -f%a "$directory_path" 2> /dev/null || echo "0")
+            local last_modified_epoch=$(stat -f%m "$directory_path" 2> /dev/null || echo "0")
             local current_epoch=$(date +%s)
-            local days_since_access=$(((current_epoch - last_access_epoch) / 86400))
+            local days_since_modified=$(((current_epoch - last_modified_epoch) / 86400))
 
-            if [[ $days_since_access -lt $ORPHAN_AGE_THRESHOLD ]]; then
+            if [[ $days_since_modified -lt $ORPHAN_AGE_THRESHOLD ]]; then
                 return 1
             fi
         fi
@@ -1326,7 +1636,15 @@ perform_cleanup() {
     for resource_type in "${resource_types[@]}"; do
         IFS='|' read -r base_path label patterns <<< "$resource_type"
 
-        [[ -d "$base_path" ]] || continue
+        # Check both existence and permission to avoid hanging
+        if [[ ! -d "$base_path" ]]; then
+            continue
+        fi
+
+        # Quick permission check - if we can't ls the directory, skip it
+        if ! ls "$base_path" > /dev/null 2>&1; then
+            continue
+        fi
 
         # Build file pattern array
         local -a file_patterns=()
@@ -1338,8 +1656,18 @@ perform_cleanup() {
         # Scan and clean orphaned items
         for item_path in "${file_patterns[@]}"; do
             # Use shell glob (no ls needed)
+            # Limit iterations to prevent hanging on directories with too many files
+            local iteration_count=0
+            local max_iterations=100
+
             for match in $item_path; do
                 [[ -e "$match" ]] || continue
+
+                # Safety: limit iterations to prevent infinite loops on massive directories
+                ((iteration_count++))
+                if [[ $iteration_count -gt $max_iterations ]]; then
+                    break
+                fi
 
                 # Extract bundle ID from filename
                 local bundle_id=$(basename "$match")
@@ -1347,35 +1675,37 @@ perform_cleanup() {
                 bundle_id="${bundle_id%.binarycookies}"
 
                 if is_orphaned "$bundle_id" "$match"; then
-                    local size_kb=$(du -sk "$match" 2> /dev/null | awk '{print $1}' || echo "0")
-                    if [[ "$size_kb" -gt 0 ]]; then
-                        safe_clean "$match" "Orphaned $label: $bundle_id"
-                        ((orphaned_count++))
-                        ((total_orphaned_kb += size_kb))
+                    # Use timeout to prevent du from hanging on large/problematic directories
+                    local size_kb
+                    size_kb=$(run_with_timeout 2 du -sk "$match" 2> /dev/null | awk '{print $1}' || echo "0")
+                    if [[ -z "$size_kb" || "$size_kb" == "0" ]]; then
+                        continue
                     fi
+                    safe_clean "$match" "Orphaned $label: $bundle_id"
+                    ((orphaned_count++))
+                    ((total_orphaned_kb += size_kb))
                 fi
             done
         done
     done
 
     stop_inline_spinner
-    echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Found $orphaned_count orphaned app resources"
 
     if [[ $orphaned_count -gt 0 ]]; then
         local orphaned_mb=$(echo "$total_orphaned_kb" | awk '{printf "%.1f", $1/1024}')
-        echo "  ${GREEN}${ICON_SUCCESS}${NC} Cleaned $orphaned_count orphaned items (~${orphaned_mb}MB)"
+        echo "  ${GREEN}${ICON_SUCCESS}${NC} Cleaned $orphaned_count items (~${orphaned_mb}MB)"
         note_activity
-    else
-        echo "  ${GREEN}${ICON_SUCCESS}${NC} No orphaned app data found"
     fi
 
     rm -f "$installed_bundles"
+
+    fi # end of has_library_access check
 
     end_section
 
     # ===== 13. Apple Silicon optimizations =====
     if [[ "$IS_M_SERIES" == "true" ]]; then
-        start_section "Apple Silicon optimizations"
+        start_section "Apple Silicon updates"
         safe_clean /Library/Apple/usr/share/rosetta/rosetta_update_bundle "Rosetta 2 cache"
         safe_clean ~/Library/Caches/com.apple.rosetta.update "Rosetta 2 user cache"
         safe_clean ~/Library/Caches/com.apple.amp.mediasevicesd "Apple Silicon media service cache"
@@ -1421,6 +1751,16 @@ perform_cleanup() {
                 # Support both .inProgress (official) and .inprogress (lowercase variant)
                 while IFS= read -r inprogress_file; do
                     [[ -d "$inprogress_file" ]] || continue
+
+                    # Safety check: only delete .inProgress backups older than 24 hours
+                    # This prevents deleting backups that are currently in progress
+                    local file_mtime=$(stat -f%m "$inprogress_file" 2> /dev/null || echo "0")
+                    local current_time=$(date +%s)
+                    local hours_old=$(((current_time - file_mtime) / 3600))
+
+                    if [[ $hours_old -lt 24 ]]; then
+                        continue # Skip - backup might still be in progress
+                    fi
 
                     local size_kb=$(du -sk "$inprogress_file" 2> /dev/null | awk '{print $1}' || echo "0")
                     if [[ "$size_kb" -gt 0 ]]; then
@@ -1469,6 +1809,15 @@ perform_cleanup() {
                     while IFS= read -r inprogress_file; do
                         [[ -d "$inprogress_file" ]] || continue
 
+                        # Safety check: only delete .inProgress backups older than 24 hours
+                        local file_mtime=$(stat -f%m "$inprogress_file" 2> /dev/null || echo "0")
+                        local current_time=$(date +%s)
+                        local hours_old=$(((current_time - file_mtime) / 3600))
+
+                        if [[ $hours_old -lt 24 ]]; then
+                            continue # Skip - backup might still be in progress
+                        fi
+
                         local size_kb=$(du -sk "$inprogress_file" 2> /dev/null | awk '{print $1}' || echo "0")
                         if [[ "$size_kb" -gt 0 ]]; then
                             local backup_name=$(basename "$inprogress_file")
@@ -1502,78 +1851,6 @@ perform_cleanup() {
 
     if [[ $tm_cleaned -eq 0 ]]; then
         echo -e "  ${GREEN}${ICON_SUCCESS}${NC} No failed Time Machine backups found"
-    fi
-    end_section
-
-    # ===== Check for large project dependencies =====
-    start_section "Large project dependencies"
-
-    if [[ -t 1 ]]; then MOLE_SPINNER_PREFIX="  " start_inline_spinner "Scanning project directories..."; fi
-
-    local node_modules_size=0
-    local node_modules_count=0
-    local venv_size=0
-    local venv_count=0
-
-    # Use a single find with du to batch process node_modules
-    # This is much faster than running du separately for each directory
-    # Search only likely project directories to speed up scanning
-    local search_paths=()
-    [[ -d "$HOME/Documents" ]] && search_paths+=("$HOME/Documents")
-    [[ -d "$HOME/Desktop" ]] && search_paths+=("$HOME/Desktop")
-    [[ -d "$HOME/Projects" ]] && search_paths+=("$HOME/Projects")
-    [[ -d "$HOME/www" ]] && search_paths+=("$HOME/www")
-    [[ -d "$HOME/Code" ]] && search_paths+=("$HOME/Code")
-    [[ -d "$HOME/dev" ]] && search_paths+=("$HOME/dev")
-
-    # If no common project dirs found, search HOME but with depth 3
-    if [[ ${#search_paths[@]} -eq 0 ]]; then
-        search_paths=("$HOME")
-    fi
-
-    while IFS=$'\t' read -r size_kb nm_dir; do
-        [[ ! -d "$nm_dir" ]] && continue
-        if [[ $size_kb -gt 102400 ]]; then # > 100MB
-            ((node_modules_size += size_kb))
-            ((node_modules_count++))
-        fi
-    done < <(find "${search_paths[@]}" -type d -name "node_modules" -maxdepth 4 -mtime +60 \
-        -not -path "*/Library/*" \
-        -not -path "*/.Trash/*" \
-        -print0 2> /dev/null |
-        xargs -0 -n 20 -P 4 sh -c 'for dir in "$@"; do du -sk "$dir" 2>/dev/null || echo "0 $dir"; done' _ |
-        awk '{print $1 "\t" substr($0, index($0,$2))}' || true)
-
-    # Use a single find with du to batch process venv directories
-    while IFS=$'\t' read -r size_kb venv_dir; do
-        [[ ! -d "$venv_dir" ]] && continue
-        if [[ $size_kb -gt 51200 ]]; then # > 50MB
-            ((venv_size += size_kb))
-            ((venv_count++))
-        fi
-    done < <(find "${search_paths[@]}" -type d \( -name "venv" -o -name ".venv" -o -name "env" \) -maxdepth 4 -mtime +60 \
-        -not -path "*/Library/*" \
-        -not -path "*/.Trash/*" \
-        -not -path "*/node_modules/*" \
-        -print0 2> /dev/null |
-        xargs -0 -n 20 -P 4 sh -c 'for dir in "$@"; do du -sk "$dir" 2>/dev/null || echo "0 $dir"; done' _ |
-        awk '{print $1 "\t" substr($0, index($0,$2))}' || true)
-
-    if [[ -t 1 ]]; then stop_inline_spinner; fi
-
-    # Show suggestions if found
-    if [[ $node_modules_count -gt 0 ]] || [[ $venv_count -gt 0 ]]; then
-        if [[ $node_modules_count -gt 0 ]]; then
-            local nm_gb=$(echo "$node_modules_size" | awk '{printf "%.1f", $1/1024/1024}')
-            echo -e "  ${GRAY}○${NC} Found ${YELLOW}${nm_gb}GB${NC} in $node_modules_count old node_modules ${GRAY}(60+ days)${NC}"
-        fi
-        if [[ $venv_count -gt 0 ]]; then
-            local venv_gb=$(echo "$venv_size" | awk '{printf "%.1f", $1/1024/1024}')
-            echo -e "  ${GRAY}○${NC} Found ${YELLOW}${venv_gb}GB${NC} in $venv_count old Python venv ${GRAY}(60+ days)${NC}"
-        fi
-        echo -e "  ${YELLOW}☻${NC} Run 'mo analyze' to see details and manually clean"
-    else
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} No large unused project dependencies found"
     fi
     end_section
 

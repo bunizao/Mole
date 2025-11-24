@@ -286,7 +286,14 @@ read_key() {
         $'\n' | $'\r') echo "ENTER" ;;
         ' ') echo "SPACE" ;;
         'q' | 'Q') echo "QUIT" ;;
-        'h' | 'H') echo "HELP" ;;
+        'h') echo "LEFT" ;;
+        'j') echo "DOWN" ;;
+        'k') echo "UP" ;;
+        'l') echo "RIGHT" ;;
+        'm' | 'M') echo "MORE" ;;
+        'v' | 'V') echo "VERSION" ;;
+        't' | 'T') echo "TOUCHID" ;;
+        'u' | 'U') echo "UPDATE" ;;
         'R') echo "RETRY" ;;
         'o' | 'O') echo "OPEN" ;;
         '/') echo "FILTER" ;;
@@ -434,6 +441,24 @@ get_directory_size_bytes() {
     du -sk "$path" 2> /dev/null | cut -f1 | awk '{print $1 * 1024}' || echo "0"
 }
 
+# List login items (one per line)
+list_login_items() {
+    if ! command -v osascript > /dev/null 2>&1; then
+        return
+    fi
+
+    local raw_items
+    raw_items=$(osascript -e 'tell application "System Events" to get the name of every login item' 2> /dev/null || echo "")
+    [[ -z "$raw_items" || "$raw_items" == "missing value" ]] && return
+
+    IFS=',' read -ra login_items_array <<< "$raw_items"
+    for entry in "${login_items_array[@]}"; do
+        local trimmed
+        trimmed=$(echo "$entry" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        [[ -n "$trimmed" ]] && printf "%s\n" "$trimmed"
+    done
+}
+
 # Permission checks
 check_sudo() {
     if ! sudo -n true 2> /dev/null; then
@@ -455,33 +480,81 @@ check_touchid_support() {
 # Usage: request_sudo_access "prompt message" [optional: force_password]
 request_sudo_access() {
     local prompt_msg="${1:-Admin access required}"
-    local force_password="${2:-false}"
 
-    # Check if already has sudo access
     if sudo -n true 2> /dev/null; then
         return 0
     fi
 
-    # If Touch ID is supported and not forced to use password
-    if [[ "$force_password" != "true" ]] && check_touchid_support; then
-        echo -e "${PURPLE}${ICON_ARROW}${NC} ${prompt_msg} ${GRAY}(Touch ID or password)${NC}"
-        if sudo -v 2> /dev/null; then
-            return 0
-        else
-            return 1
+    echo -e "${PURPLE}${ICON_ARROW}${NC} ${prompt_msg} ${GRAY}(Touch ID or password)${NC}"
+    sudo -k
+
+    # Use default sudo prompt (Touch ID behaves more reliably without a custom prompt)
+    local sudo_cmd=(sudo -v)
+
+    # Optional timeout command to prevent hangs
+    local timeout_cmd=""
+    for t in gtimeout timeout; do
+        if command -v "$t" > /dev/null 2>&1; then
+            timeout_cmd="$t"
+            break
         fi
-    else
-        # Traditional password method
-        echo -e "${PURPLE}${ICON_ARROW}${NC} ${prompt_msg}"
-        echo -ne "${PURPLE}${ICON_ARROW}${NC} Password: "
-        IFS= read -r -s password
-        echo ""
-        if [[ -n "$password" ]] && echo "$password" | sudo -S true 2> /dev/null; then
-            return 0
+    done
+
+    # Helper to attempt sudo with optional IO redirection and timeout
+    _run_sudo_attempt() {
+        local in="$1"
+        local out="$2"
+        local err="${3:-$2}"
+
+        local cmd=("${sudo_cmd[@]}")
+        if [[ -n "$timeout_cmd" ]]; then
+            cmd=("$timeout_cmd" 20 "${cmd[@]}")
+        fi
+
+        if [[ -n "$in" ]]; then
+            if [[ -n "$out" ]]; then
+                "${cmd[@]}" < "$in" > "$out" 2> "${err:-$out}"
+            else
+                "${cmd[@]}" < "$in"
+            fi
         else
-            return 1
+            "${cmd[@]}"
+        fi
+    }
+
+    # Try current TTY first
+    if _run_sudo_attempt "" ""; then
+        sudo -n true 2> /dev/null || true
+        return 0
+    fi
+
+    # Always talk to the real terminal so Touch ID/password prompts show up
+    local sudo_tty="/dev/tty"
+    if [[ -r "$sudo_tty" ]]; then
+        if _run_sudo_attempt "$sudo_tty" "$sudo_tty" "$sudo_tty"; then
+            sudo -n true 2> /dev/null || true
+            return 0
         fi
     fi
+
+    # Last resort: spawn a fresh pty (helps when stdin/out were redirected)
+    if command -v script > /dev/null 2>&1; then
+        local script_cmd=(script -q /dev/null)
+        if [[ -n "$timeout_cmd" ]]; then
+            script_cmd=("$timeout_cmd" 20 "${script_cmd[@]}")
+        fi
+        if "${script_cmd[@]}" "${sudo_cmd[@]}"; then
+            sudo -n true 2> /dev/null || true
+            return 0
+        fi
+    fi
+
+    # Fallback for environments without /dev/tty or script
+    if _run_sudo_attempt "" ""; then
+        sudo -n true 2> /dev/null || true
+        return 0
+    fi
+    return 1
 }
 
 request_sudo() {
@@ -506,11 +579,42 @@ update_via_homebrew() {
     else
         echo "Updating Homebrew..."
     fi
-    # Filter out common noise but show important info
-    brew update 2>&1 | grep -Ev "^(==>|Already up-to-date)" || true
+
+    # Run brew update with timeout to prevent hanging
+    # Use background process to allow interruption
+    local brew_update_timeout="${MO_BREW_UPDATE_TIMEOUT:-300}"
+    local brew_tmp_file
+    brew_tmp_file=$(mktemp -t mole-brew-update 2>/dev/null || echo "/tmp/mole-brew-update.$$")
+
+    (brew update > "$brew_tmp_file" 2>&1) &
+    local brew_pid=$!
+    local elapsed=0
+
+    # Wait for completion or timeout
+    while kill -0 $brew_pid 2>/dev/null; do
+        if [[ $elapsed -ge $brew_update_timeout ]]; then
+            kill -TERM $brew_pid 2>/dev/null || true
+            wait $brew_pid 2>/dev/null || true
+            if [[ -t 1 ]]; then stop_inline_spinner; fi
+            rm -f "$brew_tmp_file"
+            log_error "Homebrew update timed out (${brew_update_timeout}s)"
+            return 1
+        fi
+        sleep 1
+        ((elapsed++))
+    done
+
+    wait $brew_pid 2>/dev/null || {
+        if [[ -t 1 ]]; then stop_inline_spinner; fi
+        rm -f "$brew_tmp_file"
+        log_error "Homebrew update failed"
+        return 1
+    }
+
     if [[ -t 1 ]]; then
         stop_inline_spinner
     fi
+    rm -f "$brew_tmp_file"
 
     if [[ -t 1 ]]; then
         start_inline_spinner "Upgrading Mole..."
@@ -1092,7 +1196,7 @@ start_sudo_keepalive() {
     (
         local retry_count=0
         while true; do
-            if ! sudo -n true 2> /dev/null; then
+            if ! sudo -n -v 2> /dev/null; then
                 ((retry_count++))
                 if [[ $retry_count -ge 3 ]]; then
                     exit 1
@@ -1268,6 +1372,15 @@ readonly DATA_PROTECTED_BUNDLES=(
     "com.charlesproxy.charles" # Charles
     "com.telerik.Fiddler"      # Fiddler
     "com.usebruno.app"         # Bruno (API client)
+
+    # Network Proxy & VPN Tools (protect all variants)
+    "*clash*"               # All Clash variants (ClashX, ClashX Pro, Clash Verge, etc)
+    "*Clash*"               # Capitalized variants
+    "com.nssurge.surge-mac" # Surge
+    "mihomo*"               # Mihomo Party and variants
+    "*openvpn*"             # OpenVPN Connect and variants
+    "*OpenVPN*"             # OpenVPN capitalized variants
+    "net.openvpn.*"         # OpenVPN bundle IDs
 
     # ============================================================================
     # Development Tools - Git & Version Control
@@ -1563,6 +1676,14 @@ find_app_files() {
     [[ -d ~/Library/Logs/"$app_name" ]] && files_to_clean+=("$HOME/Library/Logs/$app_name")
     [[ -d ~/Library/Logs/"$bundle_id" ]] && files_to_clean+=("$HOME/Library/Logs/$bundle_id")
 
+    # Crash Reports and Diagnostics
+    while IFS= read -r -d '' report; do
+        files_to_clean+=("$report")
+    done < <(find ~/Library/Logs/DiagnosticReports \( -name "*$app_name*" -o -name "*$bundle_id*" \) -print0 2> /dev/null)
+    while IFS= read -r -d '' report; do
+        files_to_clean+=("$report")
+    done < <(find ~/Library/Logs/CrashReporter \( -name "*$app_name*" -o -name "*$bundle_id*" \) -print0 2> /dev/null)
+
     # Saved Application State
     [[ -d ~/Library/Saved\ Application\ State/"$bundle_id".savedState ]] && files_to_clean+=("$HOME/Library/Saved Application State/$bundle_id.savedState")
 
@@ -1702,6 +1823,12 @@ find_app_files() {
         files_to_clean+=("$favorite")
     done < <(find ~/Library/Favorites \( -name "$app_name*" -o -name "$bundle_id*" \) -print0 2> /dev/null)
 
+    # Unix-style configuration directories and files (cross-platform apps)
+    [[ -d ~/.config/"$app_name" ]] && files_to_clean+=("$HOME/.config/$app_name")
+    [[ -d ~/.local/share/"$app_name" ]] && files_to_clean+=("$HOME/.local/share/$app_name")
+    [[ -d ~/."$app_name" ]] && files_to_clean+=("$HOME/.$app_name")
+    [[ -f ~/."${app_name}rc" ]] && files_to_clean+=("$HOME/.${app_name}rc")
+
     # Only print if array has elements to avoid unbound variable error
     if [[ ${#files_to_clean[@]} -gt 0 ]]; then
         printf '%s\n' "${files_to_clean[@]}"
@@ -1740,6 +1867,14 @@ find_app_system_files() {
     # System Logs
     [[ -d /Library/Logs/"$app_name" ]] && system_files+=("/Library/Logs/$app_name")
     [[ -d /Library/Logs/"$bundle_id" ]] && system_files+=("/Library/Logs/$bundle_id")
+
+    # System Crash Reports and Diagnostics
+    while IFS= read -r -d '' report; do
+        system_files+=("$report")
+    done < <(find /Library/Logs/DiagnosticReports \( -name "*$app_name*" -o -name "*$bundle_id*" \) -print0 2> /dev/null)
+    while IFS= read -r -d '' report; do
+        system_files+=("$report")
+    done < <(find /Library/Logs/CrashReporter \( -name "*$app_name*" -o -name "*$bundle_id*" \) -print0 2> /dev/null)
 
     # System Frameworks
     [[ -d /Library/Frameworks/"$app_name".framework ]] && system_files+=("/Library/Frameworks/$app_name.framework")

@@ -381,8 +381,11 @@ load_applications() {
     apps_data=()
     selection_state=()
 
-    # Read apps into array
+    # Read apps into array, skip non-existent apps
     while IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb; do
+        # Skip if app path no longer exists
+        [[ ! -e "$app_path" ]] && continue
+
         apps_data+=("$epoch|$app_path|$app_name|$bundle_id|$size|$last_used|${size_kb:-0}")
         selection_state+=(false)
     done < "$apps_file"
@@ -497,6 +500,26 @@ uninstall_applications() {
         echo
 
         if [[ $REPLY =~ ^[Yy]$ ]]; then
+            # Stop Launch Agents and Daemons before removal
+            # User-level Launch Agents
+            for plist in ~/Library/LaunchAgents/"$bundle_id"*.plist; do
+                if [[ -f "$plist" ]]; then
+                    launchctl unload "$plist" 2> /dev/null || true
+                fi
+            done
+            # System-level Launch Agents
+            for plist in /Library/LaunchAgents/"$bundle_id"*.plist; do
+                if [[ -f "$plist" ]]; then
+                    sudo launchctl unload "$plist" 2> /dev/null || true
+                fi
+            done
+            # System-level Launch Daemons
+            for plist in /Library/LaunchDaemons/"$bundle_id"*.plist; do
+                if [[ -f "$plist" ]]; then
+                    sudo launchctl unload "$plist" 2> /dev/null || true
+                fi
+            done
+
             # Remove the application
             if rm -rf "$app_path" 2> /dev/null; then
                 echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Removed application"
@@ -508,8 +531,15 @@ uninstall_applications() {
             # Remove user-level related files
             while IFS= read -r file; do
                 if [[ -n "$file" && -e "$file" ]]; then
-                    if rm -rf "$file" 2> /dev/null; then
-                        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Removed $(echo "$file" | sed "s|$HOME|~|" | xargs basename)"
+                    # Handle symbolic links separately (only remove the link, not the target)
+                    if [[ -L "$file" ]]; then
+                        if rm "$file" 2> /dev/null; then
+                            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Removed $(echo "$file" | sed "s|$HOME|~|" | xargs basename)"
+                        fi
+                    else
+                        if rm -rf "$file" 2> /dev/null; then
+                            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Removed $(echo "$file" | sed "s|$HOME|~|" | xargs basename)"
+                        fi
                     fi
                 fi
             done <<< "$related_files"
@@ -519,10 +549,19 @@ uninstall_applications() {
                 echo -e "  ${BLUE}${ICON_SOLID}${NC} Admin access required for system files"
                 while IFS= read -r file; do
                     if [[ -n "$file" && -e "$file" ]]; then
-                        if sudo rm -rf "$file" 2> /dev/null; then
-                            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Removed $(basename "$file")"
+                        # Handle symbolic links separately (only remove the link, not the target)
+                        if [[ -L "$file" ]]; then
+                            if sudo rm "$file" 2> /dev/null; then
+                                echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Removed $(basename "$file")"
+                            else
+                                echo -e "  ${YELLOW}${ICON_ERROR}${NC} Failed to remove: $file"
+                            fi
                         else
-                            echo -e "  ${YELLOW}${ICON_ERROR}${NC} Failed to remove: $file"
+                            if sudo rm -rf "$file" 2> /dev/null; then
+                                echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Removed $(basename "$file")"
+                            else
+                                echo -e "  ${YELLOW}${ICON_ERROR}${NC} Failed to remove: $file"
+                            fi
                         fi
                     fi
                 done <<< "$system_files"
@@ -651,19 +690,24 @@ main() {
             unset MOLE_ALT_SCREEN_ACTIVE
             unset MOLE_INLINE_LOADING MOLE_MANAGED_ALT_SCREEN
         fi
+        show_cursor
+        clear_screen
+        printf '\033[2J\033[H' >&2  # Also clear stderr
         rm -f "$apps_file"
         return 0
     fi
 
+    # Always clear on exit from selection, regardless of alt screen state
     if [[ "${MOLE_ALT_SCREEN_ACTIVE:-}" == "1" ]]; then
         leave_alt_screen
         unset MOLE_ALT_SCREEN_ACTIVE
         unset MOLE_INLINE_LOADING MOLE_MANAGED_ALT_SCREEN
     fi
 
-    # Restore cursor and show a concise summary before confirmation
+    # Restore cursor and clear screen (output to both stdout and stderr for reliability)
     show_cursor
-    clear
+    clear_screen
+    printf '\033[2J\033[H' >&2  # Also clear stderr in case of mixed output
     local selection_count=${#selected_apps[@]}
     if [[ $selection_count -eq 0 ]]; then
         echo "No apps selected"
@@ -678,7 +722,7 @@ main() {
     local name_trunc_limit=30
 
     for selected_app in "${selected_apps[@]}"; do
-        IFS='|' read -r epoch app_path app_name bundle_id size last_used <<< "$selected_app"
+        IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb <<< "$selected_app"
 
         local display_name="$app_name"
         if [[ ${#display_name} -gt $name_trunc_limit ]]; then
@@ -704,10 +748,9 @@ main() {
     local index=1
     for row in "${summary_rows[@]}"; do
         IFS='|' read -r name_cell size_cell last_cell <<< "$row"
-        printf "  %2d. %-*s  %*s  |  Last: %s\n" "$index" "$max_name_width" "$name_cell" "$max_size_width" "$size_cell" "$last_cell"
+        printf "%d. %-*s  %*s  |  Last: %s\n" "$index" "$max_name_width" "$name_cell" "$max_size_width" "$size_cell" "$last_cell"
         ((index++))
     done
-    echo ""
 
     # Execute batch uninstallation (handles confirmation)
     batch_uninstall_applications
